@@ -884,14 +884,20 @@ void ListAlias()
     string strAliasList;
     smatch smMatch;
     bool bFound = false;
+    bool bFirst = true;
 
     if (ReadRegSZ(REG_KEY_RELAY_ALIAS, REG_SETTING_ALIASES, strAliasList, ""))
     {   // format is alias=sernum,alias=sernum,alias=sernum
 
         while (regex_search(strAliasList, smMatch, regex_alias_registry))
         {
+            if (bFirst)
+                bFirst = false;
+            else
+                cout << endl;
+
             bFound = true;
-            cout << smMatch[1] << "=" << smMatch[2] << endl;
+            cout << smMatch[1] << "=" << smMatch[2];
             strAliasList = smMatch.suffix().str();
         }
     }
