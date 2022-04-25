@@ -13,14 +13,9 @@ List/enumerate all relay modules:
 Relay.exe list
 ```
 
-Query the state of a given relay relay module (addressed by its serial number):
+Query the state of a given relay relay module (addressed by its serial number or alias):
 ```
 Relay.exe query 6QMBS
-```
-
-Query the state of the first relay module (as obtained with enumerate):
-```
-Relay.exe query
 ```
 
 Query the state of multiple relays:
@@ -30,24 +25,37 @@ Relay.exe query 6QMBS 5XARZ 6VXAT
 
 Query the state of specific relays in modules:
 ```
-Relay.exe query 6QMBS=1456 5XARZ=178
-```
-
-Turn all relays in the first module on:
-```
-Relay.exe set all=on
+Relay.exe query 6QMBS@1456 5XARZ@178
 ```
 
 Turn on specific relays in a given module: (two equivalent methods)
 ```
-Relay.exe set 6QMBS=011XX0
+Relay.exe set 6QMBS:011XX0
 Relay.exe set 6QMBS 1=0 2=1 3=1 6=0
 ```
 
 Turn on specific relays in multiple modules:
 ```
-Relay.exe set 6QMBS=011XX0 5XARZ 1:1 5:1
+Relay.exe set 6QMBS:011XX0 5XARZ 1=1 5=1
 ```
 
+Set an alias for a module:
+```
+Relay.exe alias #1=6QMBS #2=5XARZ
+```
+Then address a module by the alias:
+```
+Relay.exe set #1:011XX0 #2 1=1 5=1
+```
+
+List aliases for a module:
+```
+Relay.exe alias
+```
+
+Delete aliases for a module:
+```
+Relay.exe alias -#1 -#2
+```
 
 Kerry S Martin, martin@wild-wood.net, wssm243@gmail.com
