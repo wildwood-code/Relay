@@ -210,9 +210,11 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="EasyRegistry.cpp" />
     <ClCompile Include="Relay.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="EasyRegistry.h" />
     <ClInclude Include="usb_relay_device.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

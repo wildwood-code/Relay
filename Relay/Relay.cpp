@@ -7,7 +7,7 @@
 *   Command line utility to control USB HID relays (usb_relay_device.dll).
 *
 * Created    : 01/11/2022
-* Modified   : 01/14/2022
+* Modified   : 04/24/2022
 * Author     : Kerry S. Martin, martin@wild-wood.net
 *******************************************************************************/
 
@@ -17,12 +17,18 @@
 #include <map>
 using namespace std;
 
+#include "EasyRegistry.h"
+
 // USB HID relay interface (usb_relay_device.dll)
 #include "usb_relay_device.h"
 #pragma comment(lib, "x64/usb_relay_device.lib")
 
 // version information
-constexpr char APP_VERSION[] = "1.00";
+constexpr char APP_VERSION[] = "1.1";
+
+// registry key
+constexpr char REG_KEY_RELAY_ALIAS[] = "SOFTWARE\\WWES\\Relay";
+constexpr char REG_SETTING_ALIASES[] = "Aliases";
 
 // map to hold set states for relays
 enum class LOGIC { H, L, X };
@@ -55,10 +61,25 @@ int Relays_Get_NumChannels(string sernum, const MODULE_CHANNELS& channels);
 bool Is_Sernum_Present(string sernum, const MODULE_CHANNELS& channels);
 LOGIC get_state(string status);
 LOGIC get_state(char status);
+void AssignAlias(string alias, string sernum);
+void RemoveAlias(string alias);
+void ListAlias();
+string GetAliasSernum(string alias_or_sernum);
+
+// string literals for common regex patterns
+// alias_name will match any sernum as well
+#define T_SERNUM "[A-Z0-9]{5}"
+#define T_ALIAS_NAME "[_#~@A-Z0-9][-_#~@A-Z0-9]*"
+#define T_LOGIC_BITS "[0L1HX_.]"
+#define T_LOGICS "ON|1|H|NO|OFF|0|L|NC"
+#define T_CHANNELS "[1-8]"
 
 // regex patterns for common usage
 const regex regex_on_vals("^(?:ON|1|H|NO)$", regex::icase);
 const regex regex_off_vals("^(?:OFF|0|L|NC)$", regex::icase);
+const regex regex_sernum("^(" T_SERNUM ")$", regex::icase);
+const regex regex_alias_name("^(" T_ALIAS_NAME ")$", regex::icase);
+const regex regex_alias_registry("(" T_ALIAS_NAME ")[=:](" T_SERNUM "),?", regex::icase);
 
 
 /*******************************************************************************
@@ -76,17 +97,18 @@ int main(int argc, char* argv[])
     const regex regex_enumerate("^(?:ENUM|ENUMerate|L|List)$", regex::icase);
     const regex regex_set("^SET$", regex::icase);
     const regex regex_query("^(?:Q|Query)$", regex::icase);
+    const regex regex_alias("^ALIAS$", regex::icase);
 
     // regex patterns for parsing SET command
-    const regex regex_sernum_pattern("^([a-z0-9]{5})[=:]([0L1HX_.]{1,8})$", regex::icase);
-    const regex regex_pattern("^([0L1HX_.]{1,8})$", regex::icase);
-    const regex regex_ch_set("^([1-8])[=:](ON|1|H|NO|OFF|0|L|NC)$", regex::icase);
-    const regex regex_all("^ALL[=:](ON|1|H|NO|OFF|0|L|NC)$", regex::icase);
+    const regex regex_sernum_pattern("^(" T_ALIAS_NAME "):(" T_LOGIC_BITS "{1,8})$", regex::icase);
+    const regex regex_ch_set("^(" T_CHANNELS ")=(" T_LOGICS ")$", regex::icase);
 
     // regex patterns for parsing QUERY command
-    const regex regex_sernum("^([a-z0-9]{5})$", regex::icase);
-    const regex regex_chlist("^([1-8]{1,8})$", regex::icase);
-    const regex regex_query_chlist("^([a-z0-9]{5})[=:]([1-8]{1,8})$", regex::icase);
+    const regex regex_query_chlist("^(" T_ALIAS_NAME ")[@:](" T_CHANNELS "{1,8})$", regex::icase);
+
+    // regex patterns for parsing ALIAS command
+    const regex regex_alias_assign("^\\+?(" T_ALIAS_NAME ")[=:](" T_SERNUM ")$", regex::icase);
+    const regex regex_alias_remove("^-(" T_ALIAS_NAME ")$", regex::icase);
 
     ERROR_CODES error = ERROR_CODES::NONE;
     string error_sernum = "";
@@ -123,13 +145,45 @@ int main(int argc, char* argv[])
         {
             if (Relays_Get_Sernums(channels))
             {
-                if (regex_match(cmd, regex_set) && num_args>1)
+                if (regex_match(cmd, regex_alias) && num_args >= 1)
+                {   // process ALIAS parameters
+                    //   ALIAS alias[=:]sernum {...}
+                    //   ALIAS -alias {...}
+                    //   ALIAS
+
+                    if (num_args == 1)
+                    {
+                        ListAlias();
+                    }
+                    else
+                    {
+                        for (auto i = num_args; (error == ERROR_CODES::NONE && i >= 2); --i)  // reverse order
+                        {
+                            string arg = argv[i];
+                            smatch smMatch;
+
+                            if (regex_match(arg, smMatch, regex_alias_assign))
+                            {
+                                AssignAlias(smMatch[1], smMatch[2]);
+                            }
+                            else if (regex_match(arg, smMatch, regex_alias_remove))
+                            {
+                                RemoveAlias(smMatch[1]);
+                            }
+                            else
+                            {   // something illegal here
+                                error = ERROR_CODES::SYNTAX;
+                            }
+                        }
+
+                        if (error == ERROR_CODES::NONE)
+                            ListAlias();
+                    }
+                }
+                else if (regex_match(cmd, regex_set) && num_args>1)
                 {   // process SET parameters
-                    //   SET pattern
-                    //   SET ALL=state
-                    //   SET ch:state ...
                     //   SET sernum:pattern sernum:pattern ...
-                    //   SET sernum ch:state ... sernum ch:state ...
+                    //   SET sernum ch=state ... sernum ch=state ...
                     string cur_sn = "";
                     smatch smMatch;
 
@@ -137,44 +191,9 @@ int main(int argc, char* argv[])
                     {
                         string arg = argv[i];
 
-                        if (regex_match(arg, smMatch, regex_all))
-                        {   // ALL=pattern must be 2nd and only parameter beyond SET
-                            if (i == 2 && num_args == 2)
-                            {   // cur_sn should still be "" denoting first enumerated module
-                                module[cur_sn] = MODULE{};
-                                module[cur_sn][RELAY_IDX_ALL] = get_state(smMatch[1]);
-                            }
-                            else
-                            {
-                                error = ERROR_CODES::SYNTAX;
-                            }
-                        }
-                        else if (regex_match(arg, smMatch, regex_pattern))
-                        {   // pattern alone must be 2nd and only pattern beyond set
-                            if (i == 2 && num_args == 2)
-                            {   // cur_sn should still be "" denoting first enumerated module
-                                int num_channels = Relays_Get_NumChannels(cur_sn, channels);
-                                string pattern = smMatch[1];
-                                if (pattern.length() <= num_channels)
-                                {
-                                    module[cur_sn] = MODULE{};
-                                    for (auto j = 0; j < pattern.length(); ++j)
-                                        module[cur_sn]['1' + j] = get_state(pattern[j]);
-                                }
-                                else
-                                {
-                                    error = ERROR_CODES::INVALID_CHANNEL;
-                                }
-                            }
-                            else
-                            {
-                                error = ERROR_CODES::SYNTAX;
-                            }
-                        }
-                        else if (regex_match(arg, smMatch, regex_sernum))
+                        if (regex_match(arg, smMatch, regex_alias_name))  // also matches just sernum
                         {   // update to the newly specified serial number
-                            cur_sn = smMatch[1];
-                            std::transform(cur_sn.begin(), cur_sn.end(), cur_sn.begin(), ::toupper);
+                            cur_sn = GetAliasSernum(smMatch[1]);
                             if (!Is_Sernum_Present(cur_sn, channels))
                             {
                                 error = ERROR_CODES::BAD_SERNUM;
@@ -183,9 +202,7 @@ int main(int argc, char* argv[])
                         }
                         else if (regex_match(arg, smMatch, regex_sernum_pattern))
                         {   // update to the newly specified serial number, then use the pattern
-                            cur_sn = smMatch[1];
-                            std::transform(cur_sn.begin(), cur_sn.end(), cur_sn.begin(), ::toupper);
-
+                            cur_sn = GetAliasSernum(smMatch[1]);
                             if (Is_Sernum_Present(cur_sn, channels))
                             {
                                 int num_channels = Relays_Get_NumChannels(cur_sn, channels);
@@ -208,20 +225,27 @@ int main(int argc, char* argv[])
                             }
                         }
                         else if (regex_match(arg, smMatch, regex_ch_set))
-                        {   int num_channels = Relays_Get_NumChannels(cur_sn, channels);
-
-                            if (!module.contains(cur_sn))
-                                module[cur_sn] = MODULE{};
-                            string ch = smMatch[1];
-                            int nch = ch[0] - '0';
-                            if (nch <= num_channels)
-                            {
-                                string p = smMatch[2];
-                                module[cur_sn][ch[0]] = get_state(p);
+                        {
+                            if (!cur_sn.empty())
+                            {   
+                                int num_channels = Relays_Get_NumChannels(cur_sn, channels);
+                                if (!module.contains(cur_sn))
+                                    module[cur_sn] = MODULE{};
+                                string ch = smMatch[1];
+                                int nch = ch[0] - '0';
+                                if (nch <= num_channels)
+                                {
+                                    string p = smMatch[2];
+                                    module[cur_sn][ch[0]] = get_state(p);
+                                }
+                                else
+                                {
+                                    error = ERROR_CODES::INVALID_CHANNEL;
+                                }
                             }
                             else
-                            {
-                                error = ERROR_CODES::INVALID_CHANNEL;
+                            {   // sernum has not been set
+                                error = ERROR_CODES::SYNTAX;
                             }
                         }
                         else
@@ -235,10 +259,8 @@ int main(int argc, char* argv[])
                 }
                 else if (regex_match(cmd, regex_query))
                 {   // process QUERY parameters
-                    //   QUERY
-                    //   QUERY chlist
                     //   QUERY sernum sernum sernum
-                    //   QUERY sernum:chlist sernum:chlist ...
+                    //   QUERY sernum@chlist sernum@chlist ...
 
                     smatch smMatch;
 
@@ -246,29 +268,10 @@ int main(int argc, char* argv[])
                     {
                         string arg = argv[i];
 
-                        if (regex_match(arg, smMatch, regex_chlist))
-                        {   // must be first and only argument if present
-                            if (i == 2 && num_args == 2)
-                            {   int num_channels = Relays_Get_NumChannels("", channels);
-                                queries_t q;
-                                q.sn = "";
-                                q.q = smMatch[1];
-
-                                if (q.q.length() <= num_channels)
-                                    queries.push_back(q);
-                                else
-                                    error = ERROR_CODES::INVALID_CHANNEL;
-                            }
-                            else
-                            {
-                                error = ERROR_CODES::SYNTAX;
-                            }
-                        }
-                        else if (regex_match(arg, smMatch, regex_query_chlist))
+                        if (regex_match(arg, smMatch, regex_query_chlist))
                         {
                             queries_t q;
-                            q.sn = smMatch[1];
-                            std::transform(q.sn.begin(), q.sn.end(), q.sn.begin(), ::toupper);
+                            q.sn = GetAliasSernum(smMatch[1]);
                             int num_channels = Relays_Get_NumChannels(q.sn, channels);
 
                             if (Is_Sernum_Present(q.sn, channels))
@@ -286,11 +289,10 @@ int main(int argc, char* argv[])
                                 error_sernum = q.sn;
                             }
                         }
-                        else if (regex_match(arg, smMatch, regex_sernum))
+                        else if (regex_match(arg, smMatch, regex_alias_name))  // also matches sernum
                         {
                             queries_t q;
-                            q.sn = smMatch[1];
-                            std::transform(q.sn.begin(), q.sn.end(), q.sn.begin(), ::toupper);
+                            q.sn = GetAliasSernum(smMatch[1]);
                             int num_channels = Relays_Get_NumChannels(q.sn, channels);
 
                             if (Is_Sernum_Present(q.sn, channels))
@@ -385,18 +387,18 @@ void PrintUsage(std::string strProgName)
     std::cout << "Kerry S. Martin, martin@wild-wood.net\n";
     std::cout << "Usage:\n";
     std::cout << "  " << strProgName << " ENUMerate|list                              # list all devices by sn(#channels)\n";
-    std::cout << "  " << strProgName << " Query                                       # query all channels for first device\n";
-    std::cout << "  " << strProgName << " Query chlist                                # query given channels\n";
     std::cout << "  " << strProgName << " Query sernum {sernum ...}                   # query all channels for specific SNs\n";
-    std::cout << "  " << strProgName << " Query sernum:chlist {sernum:chlist ...}     # query given channels for specifc SNs\n";
-    std::cout << "  " << strProgName << " SET pattern                                 # set given pattern on first device\n";
-    std::cout << "  " << strProgName << " SET ALL=state                               # set all channels of first device\n";
-    std::cout << "  " << strProgName << " SET ch:state {ch:state ...}                 # set given channels on first device\n";
+    std::cout << "  " << strProgName << " Query sernum@chlist {sernum@chlist ...}     # query given channels for specifc SNs\n";
     std::cout << "  " << strProgName << " SET sernum:pattern {sernum:pattern ...}     # set given patterns on specific SNs\n";
-    std::cout << "  " << strProgName << " SET sernum ch:state {ch:state ...}          # set given channels on specific SNs\n\n";
+    std::cout << "  " << strProgName << " SET sernum ch=state {ch=state ...}          # set given channels on specific SNs\n";
+    std::cout << "  " << strProgName << " ALIAS                                       # list sernum aliases\n";
+    std::cout << "  " << strProgName << " ALIAS alias=sernum                          # create new alias\n";
+    std::cout << "  " << strProgName << " ALIAS -alias                                # delete alias\n\n";
     std::cout << "    sernum = 5-character serial number\n";
     std::cout << "    state = 0|1|OFF|ON|L|H|NO|NC\n";
     std::cout << "    pattern = qq...    where q = 0|1|L|H|X\n";
+    std::cout << "    alias = starts with alphanum and -_#@~ (does not begin with -)\n";
+    std::cout << "    alias may replace any serial number\n";
 }
 
 
@@ -578,98 +580,81 @@ ERROR_CODES Relays_Query(const MODULE_QUERIES& queries, const MODULE_CHANNELS& c
     ERROR_CODES error = ERROR_CODES::NONE;
 
     if (usb_relay_init() == 0)
-    {   
-        MODULE_QUERIES more_queries = queries;  // may need to modify this if empty, so modify a copy
-
-        if (more_queries.empty())
-        {   // query all relays for the first enumerated device
-            queries_t q;
-            q.sn = "";
-            q.q = "";
-            more_queries.push_back(q);
-        }
-
-        for (queries_t Q : more_queries)
+    {
+        if (!queries.empty())
         {
-            string sernum = Q.sn;
-            string q = Q.q;
-            int num_channels = 0;
-
-            char szRelaySN[6] = "";
-
-            if (sernum.empty())
-            {   // use first enumerated module
-                channels_t s = channels[0];
-                string sn = s.sn;
-                for (int i = 0; i < 5; ++i)
-                    szRelaySN[i] = toupper(sn[i]);
-                szRelaySN[5] = '\0';
-
-                num_channels = s.channels;
-            }
-            else
+            for (queries_t Q : queries)
             {
-                // sernum is exactly 5 characters
-                for (int i = 0; i < 5; ++i)
-                    szRelaySN[i] = toupper(sernum[i]);
-                szRelaySN[5] = '\0';
+                string sernum = Q.sn;
+                string q = Q.q;
+                int num_channels = 0;
 
-                // find the sernum in channels to get the # of channels and verify that
-                // the sernum exists
-                for (channels_t s : channels)
+                char szRelaySN[6] = "";
+
+                if (!sernum.empty())
                 {
-                    if (s.sn == szRelaySN)
+                    // sernum is exactly 5 characters
+                    for (int i = 0; i < 5; ++i)
+                        szRelaySN[i] = toupper(sernum[i]);
+                    szRelaySN[5] = '\0';
+
+                    // find the sernum in channels to get the # of channels and verify that
+                    // the sernum exists
+                    for (channels_t s : channels)
                     {
-                        num_channels = s.channels;
-                        break;
-                    }
-                }
-
-                if (num_channels < 1)
-                {
-                    error = ERROR_CODES::BAD_SERNUM;
-                }
-            }
-
-            if (num_channels > 0)
-            {
-
-                intptr_t hHandle = usb_relay_device_open_with_serial_number(szRelaySN, (unsigned int)strlen(szRelaySN));
-
-                if (hHandle)
-                {
-                    unsigned int status;
-
-                    usb_relay_device_get_status(hHandle, &status);
-
-                    if (q.empty())
-                    {   // query all channels if empty
-                        for (auto i = 1; i <= num_channels; ++i)
-                            q.append(1, '0' + i);
-                    }
-
-                    for (char c : q)
-                    {
-                        if (c >= '1' && c <= '8')
+                        if (s.sn == szRelaySN)
                         {
-                            int ch = int(c - '0');
-
-                            if (ch >= 1 && ch <= num_channels)
-                            {
-                                bool st = (status & (0x0001) << (ch - 1)) ? true : false;
-
-                                if (st)
-                                    std::cout << "1";
-                                else
-                                    std::cout << "0";
-                            }
+                            num_channels = s.channels;
+                            break;
                         }
                     }
 
-                    usb_relay_device_close(hHandle);
+                    if (num_channels < 1)
+                    {
+                        error = ERROR_CODES::BAD_SERNUM;
+                    }
                 }
 
-                std::cout << " ";
+                if (num_channels > 0)
+                {
+
+                    intptr_t hHandle = usb_relay_device_open_with_serial_number(szRelaySN, (unsigned int)strlen(szRelaySN));
+
+                    if (hHandle)
+                    {
+                        unsigned int status;
+
+                        usb_relay_device_get_status(hHandle, &status);
+
+                        if (q.empty())
+                        {   // query all channels if empty
+                            for (auto i = 1; i <= num_channels; ++i)
+                                q.append(1, '0' + i);
+                        }
+
+                        for (char c : q)
+                        {
+                            if (c >= '1' && c <= '8')
+                            {
+                                int ch = int(c - '0');
+
+                                if (ch >= 1 && ch <= num_channels)
+                                {
+                                    bool st = (status & (0x0001) << (ch - 1)) ? true : false;
+
+                                    if (st)
+                                        std::cout << "1";
+                                    else
+                                        std::cout << "0";
+                                }
+                            }
+                        }
+
+                        usb_relay_device_close(hHandle);
+                    }
+
+                    std::cout << " ";
+                }
             }
         }
 
@@ -771,12 +756,7 @@ bool Is_Sernum_Present(string sernum, const MODULE_CHANNELS& channels)
 {
     bool bResult = false;
 
-    if (sernum.empty())
-    {   // first channel if sernum is blank
-        if (!channels.empty())
-            bResult = true;
-    }
-    else
+    if (!sernum.empty())
     {   // search for the matching sernum channel
         for (channels_t s : channels)
         {
@@ -805,12 +785,7 @@ int Relays_Get_NumChannels(string sernum, const MODULE_CHANNELS& channels)
 {
     int nChannels = 0;
 
-    if (sernum.empty())
-    {   // first channel if sernum is blank
-        if (!channels.empty())
-            nChannels = channels[0].channels;
-    }
-    else
+    if (!sernum.empty())
     {   // search for the matching sernum channel
         for (channels_t s : channels)
         {
@@ -823,6 +798,158 @@ int Relays_Get_NumChannels(string sernum, const MODULE_CHANNELS& channels)
     }
 
     return nChannels;
+}
+
+
+/*******************************************************************************
+* Function   : AssignAlias
+* Arguments  : alias   = alias to assign
+*              sernum  = relay serial number being aliased
+* Returns    : none
+* Description:
+*   This function makes the alias assignment in the registry
+*/
+void AssignAlias(string alias, string sernum)
+{
+    std::transform(alias.begin(), alias.end(), alias.begin(), ::toupper);
+    std::transform(sernum.begin(), sernum.end(), sernum.begin(), ::toupper);
+
+    string strAliasList;
+
+    // delete it if it is already there
+    RemoveAlias(alias);
+
+    if (ReadRegSZ(REG_KEY_RELAY_ALIAS, REG_SETTING_ALIASES, strAliasList, ""))
+        strAliasList = alias + "=" + sernum + (strAliasList.empty() ? "" : ",") + strAliasList;
+
+    WriteRegSZ(REG_KEY_RELAY_ALIAS, REG_SETTING_ALIASES, strAliasList);
+}
+
+
+/*******************************************************************************
+* Function   : RemoveAlias
+* Arguments  : alias   = alias assignment to remove
+* Returns    : none
+* Description:
+*   This function removes the given alias assignment in the registry
+*/
+void RemoveAlias(string alias)
+{
+    std::transform(alias.begin(), alias.end(), alias.begin(), ::toupper);
+
+    string strAliasList;
+    smatch smMatch;
+    bool bFound = false;
+
+    if (ReadRegSZ(REG_KEY_RELAY_ALIAS, REG_SETTING_ALIASES, strAliasList, ""))
+    {   // format is alias=sernum,alias=sernum,alias=sernum
+        // "(?<=^|,)" +
+        string strIterList = strAliasList;
+        strAliasList = "";
+        bool bFound = false;
+
+        while (regex_search(strIterList, smMatch, regex_alias_registry))
+        {
+            if (alias == smMatch[1])
+            {
+                bFound = true;
+            }
+            else
+            {
+                if (!strAliasList.empty())
+                    strAliasList += ",";
+                strAliasList += string(smMatch[1]) + "=" + string(smMatch[2]);
+            }
+
+            strIterList = smMatch.suffix().str();
+        }
+
+        if (bFound)
+        {   // no matching alias was found, if it is a valid sernum, return it otherwise return empty string
+            WriteRegSZ(REG_KEY_RELAY_ALIAS, REG_SETTING_ALIASES, strAliasList);
+        }
+    }
+}
+
+
+/*******************************************************************************
+* Function   : ListAlias
+* Arguments  : none
+* Returns    : none
+* Description:
+*   This function lists all of the alias assignments in the registry
+*/
+void ListAlias()
+{
+    string strAliasList;
+    smatch smMatch;
+    bool bFound = false;
+
+    if (ReadRegSZ(REG_KEY_RELAY_ALIAS, REG_SETTING_ALIASES, strAliasList, ""))
+    {   // format is alias=sernum,alias=sernum,alias=sernum
+
+        while (regex_search(strAliasList, smMatch, regex_alias_registry))
+        {
+            bFound = true;
+            cout << smMatch[1] << "=" << smMatch[2] << endl;
+            strAliasList = smMatch.suffix().str();
+        }
+    }
+
+    if (!bFound)
+    {
+        cout << "No aliases defined" << endl;
+    }
+}
+
+
+/*******************************************************************************
+* Function   : GetAliasSernum
+* Arguments  : alias_or_sernum   = alias or sernum from command line
+* Returns    : sernum assigned to alias or...
+*                the input argument if it is a valid sernum (does not check for existence, just valid pattern)
+*                blank if alias is not assigned and input is not a valid sernum
+* Description:
+*   This function tries to identify the sernum associated with an alias
+*/
+string GetAliasSernum(string alias_or_sernum)
+{
+    string sernum = "";
+    string strAliasList;
+    smatch smMatch;
+
+    std::transform(alias_or_sernum.begin(), alias_or_sernum.end(), alias_or_sernum.begin(), ::toupper);
+
+    if (ReadRegSZ(REG_KEY_RELAY_ALIAS, REG_SETTING_ALIASES, strAliasList, ""))
+    {   // format is alias=sernum,alias=sernum,alias=sernum
+        bool bFound = false;
+
+        while (regex_search(strAliasList, smMatch, regex_alias_registry))
+        {
+            if (alias_or_sernum == smMatch[1])
+            {   // found it in the registry. Return the assigned sernum.
+                bFound = true;
+                sernum = smMatch[2];
+                break;
+            }
+
+            strAliasList = smMatch.suffix().str();
+        }
+
+        if (!bFound)
+        {   // no matching alias was found, if it is a valid sernum, return it otherwise return empty string
+            if (regex_match(alias_or_sernum, regex_sernum))
+                sernum = alias_or_sernum;
+        }
+    }
+    else
+    {   // error, unable to get or create list
+        // if it is a valid sernum, return it, otherwise return empty string (default initialized value)
+        if (regex_match(alias_or_sernum, regex_sernum))
+            sernum = alias_or_sernum;
+    }
+
+    return sernum;
 }
 
 
